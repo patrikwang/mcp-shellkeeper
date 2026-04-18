@@ -9,14 +9,24 @@ import {
 import * as pty from "node-pty";
 import * as os from "os";
 
+const DEBUG = process.env.SHELLKEEPER_DEBUG === "true" || process.env.SHELLKEEPER_DEBUG === "1";
+
+function debugLog(...args: any[]) {
+  if (DEBUG) {
+    console.error("[ShellKeeper:DEBUG]", ...args);
+  }
+}
+
 interface TerminalSession {
   id: string;
   ptyProcess: pty.IPty;
   outputBuffer: string;
+  rawOutputBuffer: string;
   isReady: boolean;
-  promptPattern: RegExp;
   lastCommand: string;
   createdAt: Date;
+  isRelayMode: boolean;
+  lastOutputTime: number;
 }
 
 const sessions = new Map<string, TerminalSession>();
@@ -33,55 +43,49 @@ const server = new Server(
   }
 );
 
-// Helper: Sleep function
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Helper: Clean ANSI codes and control characters
 function cleanOutput(output: string): string {
   return output
-    // Remove all ANSI escape sequences
-    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "") // CSI sequences
-    .replace(/\x1b\][0-9;]*\x07/g, "") // OSC sequences
-    .replace(/\x1b\][0-9;]*;[^\x07]*\x07/g, "") // OSC with parameters
-    .replace(/\x1b[><=]/g, "") // Other escape sequences
-    .replace(/\[\?[0-9]+[hl]/g, "") // Bracketed paste mode, etc
-    // Remove control characters
-    .replace(/\r\n/g, "\n") // Windows line endings
-    .replace(/\r/g, "\n") // Carriage returns
-    // Remove prompts and artifacts
-    .replace(/\[READY\]\$ /g, "") // Custom prompt
-    .replace(/^%\s*$/gm, "") // zsh % prompt indicator
-    .replace(/^❯\s*$/gm, "") // zsh arrow prompt
-    .replace(/^~\s*$/gm, "") // home directory indicator
-    .replace(/^\$\s*$/gm, "") // bash $ prompt
-    .replace(/^>\s*$/gm, "") // generic > prompt
-    .replace(/^#\s*$/gm, "") // root # prompt
-    // Remove prompt prefixes from lines
-    .replace(/^[❯$>#]\s+/gm, "") // Remove prompt symbols at line start
-    // Remove duplicate newlines
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "")
+    .replace(/\x1b\][0-9;]*\x07/g, "")
+    .replace(/\x1b\][0-9;]*;[^\x07]*\x07/g, "")
+    .replace(/\x1b[><=]/g, "")
+    .replace(/\[\?[0-9]+[hl]/g, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .replace(/\[READY\]\$ /g, "")
+    .replace(/^%\s*$/gm, "")
+    .replace(/^❯\s*$/gm, "")
+    .replace(/^~\s*$/gm, "")
+    .replace(/^\$\s*$/gm, "")
+    .replace(/^>\s*$/gm, "")
+    .replace(/^#\s*$/gm, "")
+    .replace(/^[❯$>#]\s+/gm, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
-// Helper: Create new terminal session
 function createSession(sessionId: string, shell?: string): TerminalSession {
   const shellPath = shell || (os.platform() === "win32" ? "powershell.exe" : process.env.SHELL || "/bin/bash");
+  debugLog(`Creating session ${sessionId} with shell: ${shellPath}`);
 
   const ptyProcess = pty.spawn(shellPath, [], {
     name: "xterm-256color",
-    cols: 160,
-    rows: 40,
+    cols: 200,
+    rows: 50,
     cwd: process.env.HOME || process.cwd(),
     env: {
       ...process.env,
       TERM: "xterm-256color",
-      // Simplified prompt for easier detection
       PS1: "[READY]\\$ ",
-      // Disable SSH interactive prompts
       SSH_ASKPASS: "",
       GIT_TERMINAL_PROMPT: "0",
+      LANG: "en_US.UTF-8",
+      LC_ALL: "en_US.UTF-8",
+      TERMINFO: "/usr/share/terminfo",
     },
   });
 
@@ -89,15 +93,37 @@ function createSession(sessionId: string, shell?: string): TerminalSession {
     id: sessionId,
     ptyProcess,
     outputBuffer: "",
+    rawOutputBuffer: "",
     isReady: true,
-    promptPattern: /\[READY\]\$ $/,
     lastCommand: "",
     createdAt: new Date(),
+    isRelayMode: false,
+    lastOutputTime: Date.now(),
   };
 
-  // Capture all output
   ptyProcess.onData((data) => {
+    const now = Date.now();
+    session.rawOutputBuffer += data;
     session.outputBuffer += data;
+    session.lastOutputTime = now;
+    
+    debugLog(`[${sessionId}] onData: ${data.length} bytes`);
+    debugLog(`[${sessionId}] hex:`, data.split('').map(c => c.charCodeAt(0).toString(16)).join(' '));
+    debugLog(`[${sessionId}] Content:`, JSON.stringify(data.substring(0, 300)));
+    
+    if (data.includes("relay") || data.includes("Relay") || data.includes("KIM") || 
+        data.includes("堡垒机") || data.includes("@relay") || data.includes("@dev-") ||
+        data.includes("root@") || data.includes("#")) {
+      session.isRelayMode = true;
+      debugLog(`[${sessionId}] Relay/nested mode detected`);
+    }
+    
+    if (session.rawOutputBuffer.length > 100000) {
+      session.rawOutputBuffer = session.rawOutputBuffer.slice(-50000);
+    }
+    if (session.outputBuffer.length > 100000) {
+      session.outputBuffer = session.outputBuffer.slice(-50000);
+    }
   });
 
   ptyProcess.onExit(({ exitCode, signal }) => {
@@ -106,10 +132,33 @@ function createSession(sessionId: string, shell?: string): TerminalSession {
   });
 
   sessions.set(sessionId, session);
+  debugLog(`Session ${sessionId} created`);
   return session;
 }
 
-// Helper: Execute command and wait for completion
+async function sendRawCommand(
+  session: TerminalSession,
+  command: string,
+  waitTime: number = 2000
+): Promise<string> {
+  debugLog(`[${session.id}] Sending raw command: ${command}`);
+  
+  session.outputBuffer = "";
+  session.lastCommand = command;
+  session.isReady = false;
+  
+  session.ptyProcess.write(command + "\r");
+  
+  await sleep(waitTime);
+  
+  session.isReady = true;
+  
+  const output = session.outputBuffer;
+  debugLog(`[${session.id}] Captured output (${output.length} bytes)`);
+  
+  return output;
+}
+
 async function executeCommand(
   session: TerminalSession,
   command: string,
@@ -117,124 +166,128 @@ async function executeCommand(
 ): Promise<string> {
   session.lastCommand = command;
   session.isReady = false;
-
-  // Clear buffer before execution
   session.outputBuffer = "";
+  debugLog(`[${session.id}] Executing: ${command}`);
 
-  // Wait a bit for buffer to clear
-  await sleep(200);
+  if (session.isRelayMode) {
+    debugLog(`[${session.id}] Using Relay mode execution`);
+    session.ptyProcess.write(command + "\r");
+    
+    await sleep(500);
+    
+    const startTime = Date.now();
+    let lastLen = 0;
+    let stableCount = 0;
+    
+    while (Date.now() - startTime < timeout) {
+      const currentLen = session.outputBuffer.length;
+      const timeSinceLastOutput = Date.now() - session.lastOutputTime;
+      
+      if (timeSinceLastOutput > 2000) {
+        debugLog(`[${session.id}] Output stable for ${timeSinceLastOutput}ms`);
+        break;
+      }
+      
+      if (currentLen === lastLen) {
+        stableCount++;
+        if (stableCount > 20) {
+          debugLog(`[${session.id}] Buffer stable`);
+          break;
+        }
+      } else {
+        stableCount = 0;
+        lastLen = currentLen;
+      }
+      
+      await sleep(100);
+    }
+    
+    session.isReady = true;
+    return cleanOutput(session.outputBuffer);
+  }
 
-  // Use unique markers with timestamp to ensure uniqueness
   const timestamp = Date.now();
-  const startMarker = `===START${timestamp}===`;
-  const endMarker = `===END${timestamp}===`;
-  const exitMarker = `===EXIT${timestamp}===`;
+  const startMarker = `__START_${timestamp}__`;
+  const endMarker = `__END_${timestamp}__`;
+  const exitMarker = `__EXIT_${timestamp}__`;
 
-  // Send command with markers - DON'T use subshell so cd/export/etc work
   session.ptyProcess.write(`echo '${startMarker}'\n`);
-  await sleep(100);
+  await sleep(50);
   session.ptyProcess.write(`${command}\n`);
-  await sleep(100);
-  // Capture exit code
-  session.ptyProcess.write(`echo '${exitMarker}'$?\n`);
-  await sleep(100);
-  session.ptyProcess.write(`echo '${endMarker}'\n`);
+  await sleep(50);
+  session.ptyProcess.write(`__EXIT_CODE=$?; echo '${exitMarker}'$__EXIT_CODE; echo '${endMarker}'\n`);
 
-  // Wait for output with timeout
   const startTime = Date.now();
-  let foundEnd = false;
+  let lastBufferLen = 0;
+  let stableCount = 0;
 
   while (Date.now() - startTime < timeout) {
     const output = session.outputBuffer;
-
-    // Simple check: do we have the end marker?
+    
     if (output.includes(endMarker)) {
-      // Wait a bit more to ensure prompt is back
-      await sleep(300);
-      foundEnd = true;
+      debugLog(`[${session.id}] Found end marker`);
+      await sleep(100);
       break;
+    }
+    
+    if (output.length === lastBufferLen) {
+      stableCount++;
+      if (stableCount > 20) {
+        debugLog(`[${session.id}] Buffer stable`);
+        break;
+      }
+    } else {
+      stableCount = 0;
+      lastBufferLen = output.length;
     }
 
     await sleep(100);
   }
 
-  if (!foundEnd) {
-    session.isReady = true;
-    throw new Error(`Command timeout after ${timeout}ms. Command might still be running or waiting for input.`);
-  }
-
   session.isReady = true;
-
-  // Extract output between markers
   const output = session.outputBuffer;
+  debugLog(`[${session.id}] Output: ${output.length} bytes`);
 
-  // Find the LAST occurrence of markers (in case command appears multiple times in buffer)
-  const startIdx = output.lastIndexOf(startMarker);
-  const endIdx = output.lastIndexOf(endMarker);
+  const startIdx = output.indexOf(startMarker);
+  const endIdx = output.indexOf(endMarker);
 
   if (startIdx === -1 || endIdx === -1 || startIdx >= endIdx) {
     return cleanOutput(output);
   }
 
-  // Extract exit code
   let exitCode = 0;
-  const exitMarkerPattern = new RegExp(`${exitMarker}(\\d+)`);
-  const exitMatch = output.match(exitMarkerPattern);
+  const exitMatch = output.match(new RegExp(`${exitMarker}(\\d+)`));
   if (exitMatch) {
     exitCode = parseInt(exitMatch[1], 10);
   }
 
-  // Get content between markers
   let result = output.substring(startIdx + startMarker.length, endIdx);
-
-  // Clean up the result
+  
   const lines = result.split("\n");
-  let skippedCommandEcho = false;
-
-  const filteredLines = lines.filter((line, index) => {
+  const filteredLines = lines.filter((line) => {
     const trimmed = line.trim();
-
-    // Skip empty lines
     if (trimmed === "") return false;
-
-    // Skip marker lines
     if (trimmed.includes(startMarker)) return false;
     if (trimmed.includes(endMarker)) return false;
     if (trimmed.includes(exitMarker)) return false;
     if (trimmed.startsWith("echo ")) return false;
-
-    // Skip the exact command echo
     if (trimmed === command) return false;
-
-    // Skip first non-empty line after markers (usually command echo with prompt)
-    // Pattern: "❯ command" or "$ command" or "> command"
-    if (!skippedCommandEcho &&
-        (trimmed.match(/^[❯$>#]\s+/) ||
-         trimmed.endsWith(command) ||
-         trimmed.includes(command.split(' ')[0]))) {
-      skippedCommandEcho = true;
-      return false;
-    }
-
+    if (trimmed.startsWith("__EXIT_CODE=")) return false;
     return true;
   });
 
   result = filteredLines.join("\n");
   const cleanedResult = cleanOutput(result);
 
-  // Throw error if command failed
   if (exitCode !== 0) {
     throw new Error(
-      `Command exited with code ${exitCode}\n` +
-      `Command: ${command}\n` +
-      `Output: ${cleanedResult || "(no output)"}`
+      `Command exited with code ${exitCode}\nCommand: ${command}\nOutput: ${cleanedResult || "(no output)"}`
     );
   }
 
   return cleanedResult;
 }
 
-// Define MCP tools
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
@@ -270,11 +323,37 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "terminal_send",
+        description:
+          "Send a command to terminal without waiting for markers. " +
+          "Useful for Relay/special terminals that don't work well with standard execute. " +
+          "Returns the buffer content after waiting specified time.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            command: {
+              type: "string",
+              description: "The command to send",
+            },
+            session_id: {
+              type: "string",
+              description: "Session identifier (default: 'default')",
+              default: "default",
+            },
+            wait_time: {
+              type: "number",
+              description: "Time to wait for output in milliseconds (default: 2000)",
+              default: 2000,
+            },
+          },
+          required: ["command"],
+        },
+      },
+      {
         name: "terminal_new_session",
         description:
           "Create a new isolated terminal session. " +
-          "Useful when you want to maintain multiple separate contexts " +
-          "(e.g., one session per server, or separate sessions for different tasks).",
+          "Useful when you want to maintain multiple separate contexts.",
         inputSchema: {
           type: "object",
           properties: {
@@ -284,7 +363,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             shell: {
               type: "string",
-              description: "Shell to use (optional, defaults to system default: bash/zsh on Unix, powershell on Windows)",
+              description: "Shell to use (optional, defaults to system default)",
             },
           },
           required: ["session_id"],
@@ -292,7 +371,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "terminal_list_sessions",
-        description: "List all active terminal sessions with their status and metadata",
+        description: "List all active terminal sessions with their status",
         inputSchema: {
           type: "object",
           properties: {},
@@ -315,8 +394,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "terminal_get_buffer",
         description:
-          "Get the raw output buffer from a session. " +
-          "Useful for debugging or when you need to see the unprocessed terminal output.",
+          "Get the output buffer from a session. " +
+          "Returns both clean and raw buffers for debugging.",
         inputSchema: {
           type: "object",
           properties: {
@@ -325,10 +404,40 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description: "Session ID (default: 'default')",
               default: "default",
             },
-            clean: {
+            raw: {
               type: "boolean",
-              description: "Clean ANSI codes and control characters (default: true)",
-              default: true,
+              description: "Return raw buffer without cleaning (default: false)",
+              default: false,
+            },
+          },
+        },
+      },
+      {
+        name: "terminal_clear_buffer",
+        description: "Clear the output buffer for a session",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: {
+              type: "string",
+              description: "Session ID (default: 'default')",
+              default: "default",
+            },
+          },
+        },
+      },
+      {
+        name: "terminal_probe",
+        description:
+          "Send a probe command to detect current terminal state and prompt. " +
+          "Useful for nested SSH/kcsctl sessions where output might not be captured normally.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            session_id: {
+              type: "string",
+              description: "Session ID (default: 'default')",
+              default: "default",
             },
           },
         },
@@ -337,7 +446,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
-// Handle tool calls
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
@@ -345,36 +453,44 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case "terminal_execute": {
         const { command, session_id = "default", timeout = 30000 } = args as any;
-
-        // Validate timeout
         const validTimeout = Math.min(Math.max(timeout, 1000), 120000);
 
-        // Create session if doesn't exist
         let session = sessions.get(session_id);
         if (!session) {
           console.error(`[ShellKeeper] Creating new session: ${session_id}`);
           session = createSession(session_id);
-          // Wait for session to initialize
           await sleep(500);
         }
 
         if (!session.isReady) {
           throw new Error(
-            `Session ${session_id} is busy executing: ${session.lastCommand}. ` +
-            `Please wait or use a different session.`
+            `Session ${session_id} is busy executing: ${session.lastCommand}`
           );
         }
 
-        console.error(`[ShellKeeper] Executing in session ${session_id}: ${command}`);
+        console.error(`[ShellKeeper] Execute: ${command}`);
         const output = await executeCommand(session, command, validTimeout);
 
         return {
-          content: [
-            {
-              type: "text",
-              text: output || "(Command executed successfully with no output)",
-            },
-          ],
+          content: [{ type: "text", text: output || "(no output)" }],
+        };
+      }
+
+      case "terminal_send": {
+        const { command, session_id = "default", wait_time = 2000 } = args as any;
+
+        let session = sessions.get(session_id);
+        if (!session) {
+          console.error(`[ShellKeeper] Creating new session: ${session_id}`);
+          session = createSession(session_id);
+          await sleep(500);
+        }
+
+        console.error(`[ShellKeeper] Send: ${command}`);
+        const output = await sendRawCommand(session, command, wait_time);
+
+        return {
+          content: [{ type: "text", text: cleanOutput(output) || "(no output)" }],
         };
       }
 
@@ -382,23 +498,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { session_id, shell } = args as any;
 
         if (sessions.has(session_id)) {
-          throw new Error(
-            `Session ${session_id} already exists. ` +
-            `Use terminal_close_session first if you want to recreate it.`
-          );
+          throw new Error(`Session ${session_id} already exists`);
         }
 
         console.error(`[ShellKeeper] Creating new session: ${session_id}`);
         createSession(session_id, shell);
-        await sleep(500); // Wait for initialization
+        await sleep(500);
 
         return {
-          content: [
-            {
-              type: "text",
-              text: `Created new terminal session: ${session_id}${shell ? ` (shell: ${shell})` : ""}`,
-            },
-          ],
+          content: [{
+            type: "text",
+            text: `Created session: ${session_id}${shell ? ` (shell: ${shell})` : ""}`,
+          }],
         };
       }
 
@@ -406,45 +517,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const sessionList = Array.from(sessions.entries()).map(([id, session]) => ({
           id,
           ready: session.isReady,
+          relayMode: session.isRelayMode,
           lastCommand: session.lastCommand || "(none)",
-          createdAt: session.createdAt.toISOString(),
+          bufferLen: session.outputBuffer.length,
           uptime: Math.floor((Date.now() - session.createdAt.getTime()) / 1000),
         }));
 
         if (sessionList.length === 0) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: "No active sessions",
-              },
-            ],
-          };
+          return { content: [{ type: "text", text: "No active sessions" }] };
         }
 
         const formatted = sessionList
-          .map(
-            (s) =>
-              `  • ${s.id}\n` +
-              `    Status: ${s.ready ? "✓ ready" : "⏳ busy"}\n` +
-              `    Last command: ${s.lastCommand}\n` +
-              `    Uptime: ${s.uptime}s`
-          )
+          .map((s) => `  • ${s.id}\n    Ready: ${s.ready}, Relay: ${s.relayMode}\n    Buffer: ${s.bufferLen} bytes, Uptime: ${s.uptime}s\n    Last: ${s.lastCommand}`)
           .join("\n\n");
 
         return {
-          content: [
-            {
-              type: "text",
-              text: `Active sessions (${sessionList.length}):\n\n${formatted}`,
-            },
-          ],
+          content: [{ type: "text", text: `Active sessions (${sessionList.length}):\n\n${formatted}` }],
         };
       }
 
       case "terminal_close_session": {
         const { session_id } = args as any;
-
         const session = sessions.get(session_id);
         if (!session) {
           throw new Error(`Session ${session_id} not found`);
@@ -455,32 +548,68 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         sessions.delete(session_id);
 
         return {
-          content: [
-            {
-              type: "text",
-              text: `Closed session: ${session_id}`,
-            },
-          ],
+          content: [{ type: "text", text: `Closed session: ${session_id}` }],
         };
       }
 
       case "terminal_get_buffer": {
-        const { session_id = "default", clean = true } = args as any;
-
+        const { session_id = "default", raw = false } = args as any;
         const session = sessions.get(session_id);
         if (!session) {
           throw new Error(`Session ${session_id} not found`);
         }
 
-        const buffer = clean ? cleanOutput(session.outputBuffer) : session.outputBuffer;
+        const buffer = raw ? session.rawOutputBuffer : session.outputBuffer;
+        const result = cleanOutput(buffer);
+        
+        let info = `\n\n--- Session Info ---\nID: ${session_id}\nRelayMode: ${session.isRelayMode}\nCleanBufferLen: ${session.outputBuffer.length}\nRawBufferLen: ${session.rawOutputBuffer.length}\nReady: ${session.isReady}\nLastCmd: ${session.lastCommand}`;
 
         return {
-          content: [
-            {
-              type: "text",
-              text: buffer || "(Empty buffer)",
-            },
-          ],
+          content: [{ type: "text", text: result || "(empty)" + info }],
+        };
+      }
+
+      case "terminal_clear_buffer": {
+        const { session_id = "default" } = args as any;
+        const session = sessions.get(session_id);
+        if (!session) {
+          throw new Error(`Session ${session_id} not found`);
+        }
+
+        session.outputBuffer = "";
+        session.rawOutputBuffer = "";
+        debugLog(`[${session_id}] Buffer cleared`);
+
+        return {
+          content: [{ type: "text", text: `Buffer cleared for session: ${session_id}` }],
+        };
+      }
+
+      case "terminal_probe": {
+        const { session_id = "default" } = args as any;
+        const session = sessions.get(session_id);
+        if (!session) {
+          throw new Error(`Session ${session_id} not found`);
+        }
+
+        const beforeLen = session.rawOutputBuffer.length;
+        const probeMarker = `PROBE_${Date.now()}`;
+        
+        session.ptyProcess.write(`echo "${probeMarker}"; pwd; whoami; echo "ENDPROBE"\n`);
+        
+        await sleep(3000);
+        
+        const afterLen = session.rawOutputBuffer.length;
+        const newOutput = session.rawOutputBuffer.slice(beforeLen);
+        
+        debugLog(`[${session_id}] Probe: before=${beforeLen}, after=${afterLen}, diff=${afterLen - beforeLen}`);
+        debugLog(`[${session_id}] Probe output:`, JSON.stringify(newOutput));
+        
+        return {
+          content: [{
+            type: "text",
+            text: `Probe sent.\nBuffer before: ${beforeLen} bytes\nBuffer after: ${afterLen} bytes\nNew data: ${afterLen - beforeLen} bytes\n\nNew output:\n${cleanOutput(newOutput) || "(none captured)"}\n\nFull raw buffer (${session.rawOutputBuffer.length} bytes):\n${session.rawOutputBuffer.slice(-2000)}`,
+          }],
         };
       }
 
@@ -490,45 +619,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   } catch (error: any) {
     console.error(`[ShellKeeper] Error:`, error);
     return {
-      content: [
-        {
-          type: "text",
-          text: `Error: ${error.message}`,
-        },
-      ],
+      content: [{ type: "text", text: `Error: ${error.message}` }],
       isError: true,
     };
   }
 });
 
-// Cleanup on exit
 process.on("SIGINT", () => {
   console.error("[ShellKeeper] Shutting down...");
-  sessions.forEach((session) => {
-    session.ptyProcess.kill();
-  });
+  sessions.forEach((session) => session.ptyProcess.kill());
   process.exit(0);
 });
 
 process.on("SIGTERM", () => {
   console.error("[ShellKeeper] Shutting down...");
-  sessions.forEach((session) => {
-    session.ptyProcess.kill();
-  });
+  sessions.forEach((session) => session.ptyProcess.kill());
   process.exit(0);
 });
 
-// Start server
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("[ShellKeeper] MCP Server started successfully");
-  console.error("[ShellKeeper] Ready to handle terminal sessions");
+  console.error("[ShellKeeper] MCP Server started");
+  console.error("[ShellKeeper] Debug mode:", DEBUG ? "ON" : "OFF");
 }
 
 main().catch((error) => {
   console.error("[ShellKeeper] Fatal error:", error);
   process.exit(1);
 });
-
-
